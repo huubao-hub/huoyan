@@ -90,6 +90,7 @@ def get_alarm_video(current_user, alarm_id):
             return jsonify({'message': 'Alarm not found or unauthorized'}), 404
         return jsonify({'video_path': result[0]})
 
+# 修改create_alarm接口，改为存储图片路径
 @app.route('/alarms', methods=['POST'])
 @token_required
 def create_alarm(current_user):
@@ -98,19 +99,59 @@ def create_alarm(current_user):
     left = data.get('left')
     right = data.get('right')
     bottom = data.get('bottom')
-    video_path = data.get('video_path')
+    image_path = data.get('image_path')  # 改为image_path
     
     with connection.cursor() as cursor:
         cursor.execute(
-            "INSERT INTO alarm (time, top_location, left_location, right_location, bottom_location, video_path, user_id) "
+            "INSERT INTO alarm (time, top_location, left_location, right_location, bottom_location, image_path, user_id) "
             "VALUES (NOW(), %s, %s, %s, %s, %s, %s)",
-            (top, left, right, bottom, video_path, current_user['id'])
+            (top, left, right, bottom, image_path, 0)  # 默认user_id为0表示未处理的报警
         )
         connection.commit()
         return jsonify({'message': 'Alarm created successfully'}), 201
+    
+#新增条件查询接口
+@app.route('/alarms/query', methods=['GET'])
+@token_required
+def query_alarms(current_user):
+    """支持时间范围和状态的条件查询"""
+    start_time = request.args.get('start_time')
+    end_time = request.args.get('end_time')
+    status = request.args.get('status', type=int)  # 0=未处理，1=已处理
+    
+    # 构建查询条件
+    base_query = "SELECT * FROM alarm WHERE "
+    conditions = []
+    params = []
+    
+    if start_time and end_time:
+        conditions.append("time BETWEEN %s AND %s")
+        params.extend([start_time, end_time])
+    
+    if status is not None:
+        if status == 0:
+            conditions.append("user_id = 0")
+        else:
+            conditions.append("user_id != 0")
+    
+    # 组合查询语句
+    if not conditions:
+        return jsonify([]), 400
+    query = base_query + " AND ".join(conditions)
+    
+    with connection.cursor(pymysql.cursors.DictCursor) as cursor:
+        # 管理员可查询所有数据，普通用户仅限自己处理的报警
+        if current_user['role'] != 'admin':
+            if status == 0:
+                return jsonify([]), 403  # 普通用户不可查未处理报警
+            query += " AND user_id = %s"
+            params.append(current_user['id'])
+        
+        cursor.execute(query, params)
+        alarms = cursor.fetchall()
+        return jsonify(alarms)
 
 # 在server.py中添加以下路由
-
 @app.route('/alarms/unprocessed', methods=['GET'])
 @token_required
 def get_unprocessed_alarms(current_user):
@@ -118,7 +159,7 @@ def get_unprocessed_alarms(current_user):
         return jsonify({'message': '只有管理员可以访问未处理报警'}), 403
     
     with connection.cursor(pymysql.cursors.DictCursor) as cursor:
-        cursor.execute("SELECT * FROM alarm WHERE user_id = 0")
+        cursor.execute("SELECT id, time, top_location, left_location, image_path FROM alarm WHERE user_id = 0")  # 确保选择 image_path
         alarms = cursor.fetchall()
         return jsonify(alarms)
 

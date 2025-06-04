@@ -150,6 +150,8 @@ class VideoStreamThread(QThread):
         self.stream_url = stream_url
         self.token = token
         self.running = True
+        self.frame_count = 0
+        self.process_every_n_frames = 5  # 每5帧处理一次
 
     def run(self):
         cap = cv2.VideoCapture(self.stream_url)
@@ -157,10 +159,15 @@ class VideoStreamThread(QThread):
             ret, frame = cap.read()
             if not ret:
                 continue
+                
+            self.frame_count += 1
+            if self.frame_count % self.process_every_n_frames != 0:
+                continue
+                
+            # 缩小图像尺寸减轻处理负担
+            frame = cv2.resize(frame, (320, 180))
 
             # 进行火灾检测
-            # 这里使用简单的红色检测作为示例
-            # 实际应用中应该使用更复杂的算法
             hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
             lower_red = np.array([0, 120, 70])
             upper_red = np.array([10, 255, 255])
@@ -169,7 +176,6 @@ class VideoStreamThread(QThread):
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
             if contours:
-                # 找到最大的轮廓
                 c = max(contours, key=cv2.contourArea)
                 if cv2.contourArea(c) > 500:  # 面积阈值
                     x, y, w, h = cv2.boundingRect(c)
@@ -179,9 +185,6 @@ class VideoStreamThread(QThread):
             self.frame_received.emit(frame, -1, -1, -1, -1)
 
         cap.release()
-
-    def stop(self):
-        self.running = False
 
 
 class MapViewer(QGraphicsView):
@@ -588,11 +591,6 @@ class MainWindow(QWidget):
 
         self.setLayout(main_layout)
 
-        # 初始化媒体播放器
-        self.media_player = QMediaPlayer()
-        self.media_player.setVideoOutput(self.video_widget)
-        self.media_player.stateChanged.connect(self.handle_video_state)
-
         # 更新时间
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_time)
@@ -643,23 +641,34 @@ class MainWindow(QWidget):
             response = requests.get(f'http://localhost:5000/alarms/{alarm_id}/video', headers=headers)
 
             if response.status_code == 200:
-                video_path = response.json()['video_path']
-                # 确保路径正确
-                if not os.path.exists(video_path):
-                    QMessageBox.warning(self, '警告', '视频文件不存在')
+                image_path = response.json()['video_path']  # 注意: 虽然API路径是video，但实际返回的是图片路径
+                if not os.path.exists(image_path):
+                    QMessageBox.warning(self, '警告', '图片文件不存在')
                     return
 
-                self.cv_label.hide()
-                self.video_widget.show()
-                media_content = QMediaContent(QUrl.fromLocalFile(video_path))
-                if media_content.isNull():
-                    QMessageBox.warning(self, '警告', '不支持的视频格式')
+                # 显示图片而不是播放视频
+                pixmap = QPixmap(image_path)
+                if pixmap.isNull():
+                    QMessageBox.warning(self, '警告', '无法加载图片')
                     return
-
-                self.media_player.setMedia(media_content)
-                self.media_player.play()
+                    
+                # 创建图片查看对话框
+                dialog = QDialog(self)
+                dialog.setWindowTitle('报警详情')
+                layout = QVBoxLayout()
+                
+                image_label = QLabel()
+                image_label.setPixmap(pixmap.scaled(800, 600, Qt.KeepAspectRatio))
+                
+                close_btn = QPushButton('关闭')
+                close_btn.clicked.connect(dialog.close)
+                
+                layout.addWidget(image_label)
+                layout.addWidget(close_btn)
+                dialog.setLayout(layout)
+                dialog.exec_()
             else:
-                QMessageBox.warning(self, '警告', '无法加载报警视频')
+                QMessageBox.warning(self, '警告', '无法加载报警详情')
         except Exception as e:
             QMessageBox.critical(self, '错误', f'加载报警详情失败: {str(e)}')
 
@@ -673,8 +682,15 @@ class MainWindow(QWidget):
             self.info_label.setText(f"发生火灾! 具体位置： top: {top}, left: {left}, right: {right}, bottom: {bottom}")
             cv2.rectangle(frame, (left, top), (right, bottom), (0, 0, 255), 2)
 
-            # 保存报警视频片段
-            video_path = f"alarm_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+            # 保存报警图片
+            img_name = f"alarm_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+            img_path = os.path.join("alarm_images", img_name)
+            
+            # 确保目录存在
+            os.makedirs("alarm_images", exist_ok=True)
+            
+            # 保存图片
+            cv2.imwrite(img_path, frame)
 
             try:
                 headers = {'Authorization': self.token, 'Content-Type': 'application/json'}
@@ -683,7 +699,7 @@ class MainWindow(QWidget):
                     'left': left,
                     'right': right,
                     'bottom': bottom,
-                    'video_path': video_path
+                    'image_path': img_path
                 }
                 response = requests.post('http://localhost:5000/alarms', headers=headers, json=data)
 
@@ -693,7 +709,8 @@ class MainWindow(QWidget):
             except Exception as e:
                 print(f"Failed to save alarm: {str(e)}")
 
-        # 显示OpenCV帧
+        # 显示处理后的帧
+        frame = cv2.resize(frame, (640, 360))  # 调整显示尺寸
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = frame.shape
         bytes_per_line = ch * w
@@ -788,7 +805,7 @@ class AdminPanel(QWidget):
 
         self.alarm_table = QTableWidget()
         self.alarm_table.setColumnCount(6)
-        self.alarm_table.setHorizontalHeaderLabels(['ID', '时间', '位置', '视频路径', '状态', '操作'])
+        self.alarm_table.setHorizontalHeaderLabels(['ID', '时间', '位置', '图片路径', '状态', '操作'])  # 修改表头
         self.alarm_table.horizontalHeader().setStretchLastSection(True)
 
         layout.addWidget(self.alarm_table)
@@ -809,7 +826,8 @@ class AdminPanel(QWidget):
                     self.alarm_table.setItem(i, 2, QTableWidgetItem(
                         f"Top: {alarm['top_location']}, Left: {alarm['left_location']}"
                     ))
-                    self.alarm_table.setItem(i, 3, QTableWidgetItem(alarm['video_path']))
+                    # 兼容新旧字段名
+                    self.alarm_table.setItem(i, 3, QTableWidgetItem(alarm.get('image_path', alarm.get('video_path', 'N/A'))))
                     self.alarm_table.setItem(i, 4, QTableWidgetItem("未处理"))
 
                     process_btn = QPushButton('处理')
