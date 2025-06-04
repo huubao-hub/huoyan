@@ -78,8 +78,8 @@ class LoginWindow(QDialog):
 class VideoStreamThread(QThread):
     frame_received = pyqtSignal(np.ndarray, int, int, int, int)
 
-    def __init__(self, stream_url, token):
-        super().__init__()
+    def __init__(self, stream_url, token, parent=None):
+        super().__init__(parent)  # 这里修正
         self.stream_url = stream_url
         self.token = token
         self.running = True
@@ -160,7 +160,7 @@ class MainWindow(QWidget):
         self.alarm_playing = False
         self.init_ui()
 
-        self.video_thread = VideoStreamThread('http://192.168.51.85:8080', self.token)
+        self.video_thread = VideoStreamThread('http://192.168.187.85:8080', self.token)
         self.video_thread.frame_received.connect(self.update_frame)
         self.video_thread.start()
 
@@ -298,6 +298,7 @@ class MainWindow(QWidget):
         except Exception as e:
             QMessageBox.critical(self, '错误', f'加载报警数据失败: {str(e)}')
 
+    # 在show_alarm_details方法中修改播放代码
     def show_alarm_details(self, alarm_id):
         try:
             headers = {'Authorization': self.token}
@@ -305,9 +306,19 @@ class MainWindow(QWidget):
             
             if response.status_code == 200:
                 video_path = response.json()['video_path']
+                # 确保路径正确
+                if not os.path.exists(video_path):
+                    QMessageBox.warning(self, '警告', '视频文件不存在')
+                    return
+                    
                 self.cv_label.hide()
                 self.video_widget.show()
-                self.media_player.setMedia(QMediaContent(QUrl.fromLocalFile(video_path)))
+                media_content = QMediaContent(QUrl.fromLocalFile(video_path))
+                if media_content.isNull():
+                    QMessageBox.warning(self, '警告', '不支持的视频格式')
+                    return
+                    
+                self.media_player.setMedia(media_content)
                 self.media_player.play()
             else:
                 QMessageBox.warning(self, '警告', '无法加载报警视频')
