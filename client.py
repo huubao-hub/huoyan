@@ -25,6 +25,11 @@ import os
 # 设置QT自动缩放
 os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
 
+# 图片保存目录
+IMAGE_SAVE_DIR = 'client_images'
+if not os.path.exists(IMAGE_SAVE_DIR):
+    os.makedirs(IMAGE_SAVE_DIR)
+
 
 class LoginWindow(QDialog):
     def __init__(self):
@@ -143,48 +148,86 @@ class LoginWindow(QDialog):
 
 
 class VideoStreamThread(QThread):
-    frame_received = pyqtSignal(np.ndarray, int, int, int, int)
+    frame_received = pyqtSignal(np.ndarray, int, int, int, int, int)  # 新增报警ID参数
 
     def __init__(self, stream_url, token):
         super().__init__()
         self.stream_url = stream_url
         self.token = token
-        self.running = True
+        self.running = False  # 初始状态为False
         self.frame_count = 0
-        self.process_every_n_frames = 5  # 每5帧处理一次
+        self.process_every_n_frames = 5
+        self.cap = None  # 将cap作为实例变量
+        self.alarm_id = 0  # 报警ID计数器
 
     def run(self):
-        cap = cv2.VideoCapture(self.stream_url)
-        while self.running:
-            ret, frame = cap.read()
-            if not ret:
-                continue
-                
-            self.frame_count += 1
-            if self.frame_count % self.process_every_n_frames != 0:
-                continue
-                
-            # 缩小图像尺寸减轻处理负担
-            frame = cv2.resize(frame, (320, 180))
-
-            # 进行火灾检测
-            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-            lower_red = np.array([0, 120, 70])
-            upper_red = np.array([10, 255, 255])
-            mask = cv2.inRange(hsv, lower_red, upper_red)
-
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-            if contours:
-                c = max(contours, key=cv2.contourArea)
-                if cv2.contourArea(c) > 500:  # 面积阈值
-                    x, y, w, h = cv2.boundingRect(c)
-                    self.frame_received.emit(frame, y, x, x + w, y + h)
+        self.running = True
+        try:
+            self.cap = cv2.VideoCapture(self.stream_url)
+            while self.running:
+                ret, frame = self.cap.read()
+                if not ret:
+                    self.running = False
                     continue
 
-            self.frame_received.emit(frame, -1, -1, -1, -1)
+                self.frame_count += 1
+                if self.frame_count % self.process_every_n_frames != 0:
+                    continue
 
-        cap.release()
+                # 处理帧...
+                frame = cv2.resize(frame, (320, 180))
+                hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+                lower_red = np.array([0, 120, 70])
+                upper_red = np.array([10, 255, 255])
+                mask = cv2.inRange(hsv, lower_red, upper_red)
+
+                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+                if contours:
+                    c = max(contours, key=cv2.contourArea)
+                    if cv2.contourArea(c) > 500:  # 面积阈值
+                        x, y, w, h = cv2.boundingRect(c)
+                        self.alarm_id += 1  # 增加报警ID
+                        self.frame_received.emit(frame, y, x, x + w, y + h, self.alarm_id)
+                        # 保存图片并上传
+                        image_name = f'alarm_{self.alarm_id}.jpg'
+                        image_path = os.path.join(IMAGE_SAVE_DIR, image_name)
+                        cv2.imwrite(image_path, frame)
+                        self.upload_image(image_path, y, x, x + w, y + h)
+                        continue
+                self.frame_received.emit(frame, -1, -1, -1, -1, 0)
+
+        except Exception as e:
+            print(f"Video thread error: {str(e)}")
+        finally:
+            if self.cap is not None:
+                self.cap.release()
+
+    def stop(self):
+        """安全停止线程的方法"""
+        self.running = False
+        self.wait()  # 等待线程结束
+
+    def upload_image(self, image_path, top, left, right, bottom):
+        try:
+            headers = {'Authorization': self.token}
+            files = {'image': open(image_path, 'rb')}
+            data = {
+                'top': top,
+                'left': left,
+                'right': right,
+                'bottom': bottom
+            }
+            response = requests.post(
+                'http://localhost:5000/alarms',
+                headers=headers,
+                files=files,
+                data=data
+            )
+            if response.status_code != 201:
+                print(f"图片上传失败: {response.json().get('message', '未知错误')}")
+        except Exception as e:
+            print(f"图片上传失败: {str(e)}")
 
 
 class MapViewer(QGraphicsView):
@@ -230,6 +273,41 @@ class MapViewer(QGraphicsView):
         self.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
 
 
+class VideoMonitorDialog(QDialog):
+    def __init__(self, token, video_thread):
+        super().__init__()
+        self.setWindowTitle('实时监控画面')
+        self.setMinimumSize(1280, 720)
+        self.token = token
+        self.video_thread = video_thread
+
+        layout = QVBoxLayout()
+
+        self.cv_label = QLabel()
+        self.cv_label.setAlignment(Qt.AlignCenter)
+        self.cv_label.setStyleSheet("background-color: #000000;")
+
+        layout.addWidget(self.cv_label)
+        self.setLayout(layout)
+
+        self.video_thread.frame_received.connect(self.update_frame)
+
+    def update_frame(self, frame, top, left, right, bottom, alarm_id):
+        if top != -1 and left != -1 and right != -1 and bottom != -1:
+            cv2.rectangle(frame, (left, top), (right, bottom), (0, 0, 255), 2)
+
+        frame = cv2.resize(frame, (1280, 720))  # 调整显示尺寸
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = frame.shape
+        bytes_per_line = ch * w
+        q_img = QImage(frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        self.cv_label.setPixmap(QPixmap.fromImage(q_img))
+
+    def closeEvent(self, event):
+        # 这里不停止视频线程，因为它应该一直运行
+        event.accept()
+
+
 class MainWindow(QWidget):
     def __init__(self, token, current_user):
         super().__init__()
@@ -238,13 +316,16 @@ class MainWindow(QWidget):
         self.alarm_playing = False
         self.init_ui()
 
+        self.update_emergency_stats()
+        self.update_alarm_stats()
+
+        # 在程序启动时就开始接收视频流
         self.video_thread = VideoStreamThread('http://192.168.187.85:8080', self.token)
-        self.video_thread.frame_received.connect(self.update_frame)
+        self.video_thread.frame_received.connect(self.handle_frame_received)
         self.video_thread.start()
 
-        self.load_alarms_to_map()
-        self.update_emergency_stats()
-        self.update_alarm_stats()  # 新增：更新预警统计信息
+        # 加载已有报警数据
+        self.load_existing_alarms()
 
     def init_ui(self):
         self.setWindowTitle('视频AI智能识别及预警管理系统平台')
@@ -412,36 +493,8 @@ class MainWindow(QWidget):
         map_layout.addWidget(self.map_viewer)
         map_group.setLayout(map_layout)
 
-        # 查询条件
-        query_group = QGroupBox("条件查询")
-        query_layout = QHBoxLayout()
-
-        start_time_input = QLineEdit()
-        start_time_input.setPlaceholderText("起始时间")
-
-        end_time_input = QLineEdit()
-        end_time_input.setPlaceholderText("结束时间")
-
-        query_button = QPushButton("查询")
-
-        query_layout.addWidget(start_time_input)
-        query_layout.addWidget(end_time_input)
-        query_layout.addWidget(query_button)
-        query_group.setLayout(query_layout)
-
-        # 报警表格
-        self.alarm_table = QTableWidget()
-        self.alarm_table.setColumnCount(5)
-        self.alarm_table.setHorizontalHeaderLabels(['序号', '地址', '时间', '状态', '操作'])
-        self.alarm_table.horizontalHeader().setStretchLastSection(True)
-        self.alarm_table.verticalHeader().setVisible(False)
-        self.alarm_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.alarm_table.setEditTriggers(QTableWidget.NoEditTriggers)
-
         left_panel.addLayout(top_bar)
         left_panel.addWidget(map_group)
-        left_panel.addWidget(query_group)
-        left_panel.addWidget(self.alarm_table)
 
         # 右侧面板 - 统计信息和视频监控
         right_panel = QVBoxLayout()
@@ -534,29 +587,6 @@ class MainWindow(QWidget):
         emergency_layout.addWidget(self.emergency_table)
         emergency_group.setLayout(emergency_layout)
 
-        # 视频监控
-        video_group = QGroupBox("实时监控画面")
-        video_layout = QVBoxLayout()
-
-        self.cv_label = QLabel()
-        self.cv_label.setAlignment(Qt.AlignCenter)
-        self.cv_label.setStyleSheet("background-color: #000000;")
-        self.cv_label.setMinimumSize(640, 360)
-
-        self.video_widget = QVideoWidget()
-        self.video_widget.setMinimumSize(640, 360)
-        self.video_widget.hide()
-
-        self.info_label = QLabel()
-        self.info_label.setObjectName('Info')
-        self.info_label.setAlignment(Qt.AlignCenter)
-        self.info_label.setWordWrap(True)
-
-        video_layout.addWidget(self.cv_label)
-        video_layout.addWidget(self.video_widget)
-        video_layout.addWidget(self.info_label)
-        video_group.setLayout(video_layout)
-
         # 控制按钮
         button_layout = QHBoxLayout()
 
@@ -564,11 +594,21 @@ class MainWindow(QWidget):
         self.alarm_button.setObjectName('AlarmButton')
         self.alarm_button.clicked.connect(self.stop_alarm)
 
+        # 只对管理员显示管理面板按钮
         if self.current_user['role'] == 'admin':
             self.admin_button = QPushButton('管理面板')
             self.admin_button.setObjectName('AdminButton')
             self.admin_button.clicked.connect(self.show_admin_panel)
             button_layout.addWidget(self.admin_button)
+
+        # 所有用户都能看到报警信息和实时监控按钮
+        self.alarm_info_button = QPushButton('查看报警信息')
+        self.alarm_info_button.clicked.connect(self.show_alarm_info_dialog)
+        button_layout.addWidget(self.alarm_info_button)
+
+        self.show_monitor_button = QPushButton('显示实时监控')
+        self.show_monitor_button.clicked.connect(self.show_video_monitor_dialog)
+        button_layout.addWidget(self.show_monitor_button)
 
         button_layout.addStretch()
         button_layout.addWidget(self.alarm_button)
@@ -581,7 +621,6 @@ class MainWindow(QWidget):
         right_panel.addWidget(stats_group)
         right_panel.addWidget(pollute_group)
         right_panel.addWidget(emergency_group)
-        right_panel.addWidget(video_group)
         right_panel.addLayout(button_layout)
         right_panel.addWidget(platform_label)
 
@@ -596,6 +635,149 @@ class MainWindow(QWidget):
         self.timer.timeout.connect(self.update_time)
         self.timer.start(1000)
 
+    def show_video_monitor_dialog(self):
+        dialog = VideoMonitorDialog(self.token, self.video_thread)
+        dialog.exec_()
+
+    def show_alarm_info_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle('报警信息')
+        dialog.setMinimumSize(800, 600)
+
+        layout = QVBoxLayout()
+
+        # 查询条件
+        query_group = QGroupBox("查询条件")
+        query_layout = QHBoxLayout()
+
+        self.start_time_input = QLineEdit()
+        self.start_time_input.setPlaceholderText("起始时间 (YYYY-MM-DD)")
+
+        self.end_time_input = QLineEdit()
+        self.end_time_input.setPlaceholderText("结束时间 (YYYY-MM-DD)")
+
+        self.status_combo = QComboBox()
+        self.status_combo.addItems(['全部', '未处理', '已处理'])
+
+        query_button = QPushButton("查询")
+        query_button.clicked.connect(lambda: self.query_alarms(dialog))
+
+        query_layout.addWidget(self.start_time_input)
+        query_layout.addWidget(self.end_time_input)
+        query_layout.addWidget(self.status_combo)
+        query_layout.addWidget(query_button)
+        query_group.setLayout(query_layout)
+
+        # 报警表格
+        self.alarm_display_table = QTableWidget()
+        self.alarm_display_table.setColumnCount(6)
+        self.alarm_display_table.setHorizontalHeaderLabels(['ID', '时间', '位置', '图片路径', '状态', '操作'])
+        self.alarm_display_table.horizontalHeader().setStretchLastSection(True)
+
+        self.load_all_alarms()
+
+        close_btn = QPushButton('关闭')
+        close_btn.clicked.connect(dialog.close)
+
+        layout.addWidget(query_group)
+        layout.addWidget(self.alarm_display_table)
+        layout.addWidget(close_btn)
+        dialog.setLayout(layout)
+        dialog.exec_()
+
+    def load_all_alarms(self):
+        try:
+            headers = {'Authorization': self.token}
+            response = requests.get('http://localhost:5000/alarms', headers=headers)
+
+            if response.status_code == 200:
+                alarms = response.json()
+                self.display_alarms_in_table(self.alarm_display_table, alarms)
+        except Exception as e:
+            QMessageBox.critical(self, '错误', f'加载报警数据失败: {str(e)}')
+
+    def query_alarms(self, dialog):
+        start_time = self.start_time_input.text()
+        end_time = self.end_time_input.text()
+        status_index = self.status_combo.currentIndex()
+
+        if status_index == 0:
+            status = None
+        elif status_index == 1:
+            status = 0
+        else:
+            status = 1
+
+        try:
+            headers = {'Authorization': self.token}
+            params = {}
+            if start_time and end_time:
+                params['start_time'] = start_time
+                params['end_time'] = end_time
+            if status is not None:
+                params['status'] = status
+
+            response = requests.get('http://localhost:5000/alarms/query', headers=headers, params=params)
+
+            if response.status_code == 200:
+                alarms = response.json()
+                self.display_alarms_in_table(self.alarm_display_table, alarms)
+        except Exception as e:
+            QMessageBox.critical(self, '错误', f'查询报警数据失败: {str(e)}')
+
+    def display_alarms_in_table(self, table, alarms):
+        table.setRowCount(len(alarms))
+        for i, alarm in enumerate(alarms):
+            table.setItem(i, 0, QTableWidgetItem(str(alarm['id'])))
+            table.setItem(i, 1, QTableWidgetItem(alarm['time']))
+            table.setItem(i, 2, QTableWidgetItem(
+                f"Top: {alarm['top_location']}, Left: {alarm['left_location']}"
+            ))
+            table.setItem(i, 3, QTableWidgetItem(alarm.get('image_path', 'N/A')))
+            status = "已处理" if alarm['user_id'] != 0 else "未处理"
+            table.setItem(i, 4, QTableWidgetItem(status))
+
+            view_btn = QPushButton('查看详情')
+            view_btn.clicked.connect(lambda _, id=alarm['id']: self.show_alarm_details(id))
+            table.setCellWidget(i, 5, view_btn)
+
+    def show_alarm_details(self, alarm_id):
+        try:
+            headers = {'Authorization': self.token}
+            response = requests.get(f'http://localhost:5000/alarms/{alarm_id}/video', headers=headers)
+
+            if response.status_code == 200:
+                image_path = response.json()['image_path']
+                if not os.path.exists(image_path):
+                    QMessageBox.warning(self, '警告', '图片文件不存在')
+                    return
+
+                # 显示图片而不是播放视频
+                pixmap = QPixmap(image_path)
+                if pixmap.isNull():
+                    QMessageBox.warning(self, '警告', '无法加载图片')
+                    return
+
+                # 创建图片查看对话框
+                dialog = QDialog(self)
+                dialog.setWindowTitle('报警详情')
+                layout = QVBoxLayout()
+
+                image_label = QLabel()
+                image_label.setPixmap(pixmap.scaled(800, 600, Qt.KeepAspectRatio))
+
+                close_btn = QPushButton('关闭')
+                close_btn.clicked.connect(dialog.close)
+
+                layout.addWidget(image_label)
+                layout.addWidget(close_btn)
+                dialog.setLayout(layout)
+                dialog.exec_()
+            else:
+                QMessageBox.warning(self, '警告', '无法加载报警详情')
+        except Exception as e:
+            QMessageBox.critical(self, '错误', f'加载报警详情失败: {str(e)}')
+
     def update_time(self):
         time_label = self.findChild(QLabel)
         if time_label:
@@ -607,115 +789,11 @@ class MainWindow(QWidget):
             self.video_widget.hide()
             self.cv_label.show()
 
-    def load_alarms_to_map(self):
-        try:
-            headers = {'Authorization': self.token}
-            response = requests.get('http://localhost:5000/alarms', headers=headers)
-
-            if response.status_code == 200:
-                alarms = response.json()
-                self.alarm_table.setRowCount(len(alarms))
-
-                for i, alarm in enumerate(alarms):
-                    x = alarm['left_location']
-                    y = alarm['top_location']
-                    self.map_viewer.add_alarm_marker(x, y, alarm['id'])
-
-                    self.alarm_table.setItem(i, 0, QTableWidgetItem(str(alarm['id'])))
-                    self.alarm_table.setItem(i, 1, QTableWidgetItem(alarm['time']))
-                    self.alarm_table.setItem(i, 2, QTableWidgetItem(
-                        f"Top: {alarm['top_location']}, Left: {alarm['left_location']}"
-                    ))
-                    self.alarm_table.setItem(i, 3, QTableWidgetItem("未处理" if i % 2 == 0 else "已处理"))
-
-                    view_btn = QPushButton('查看详情')
-                    view_btn.clicked.connect(lambda _, id=alarm['id']: self.show_alarm_details(id))
-                    self.alarm_table.setCellWidget(i, 4, view_btn)
-
-        except Exception as e:
-            QMessageBox.critical(self, '错误', f'加载报警数据失败: {str(e)}')
-
-    def show_alarm_details(self, alarm_id):
-        try:
-            headers = {'Authorization': self.token}
-            response = requests.get(f'http://localhost:5000/alarms/{alarm_id}/video', headers=headers)
-
-            if response.status_code == 200:
-                image_path = response.json()['video_path']  # 注意: 虽然API路径是video，但实际返回的是图片路径
-                if not os.path.exists(image_path):
-                    QMessageBox.warning(self, '警告', '图片文件不存在')
-                    return
-
-                # 显示图片而不是播放视频
-                pixmap = QPixmap(image_path)
-                if pixmap.isNull():
-                    QMessageBox.warning(self, '警告', '无法加载图片')
-                    return
-                    
-                # 创建图片查看对话框
-                dialog = QDialog(self)
-                dialog.setWindowTitle('报警详情')
-                layout = QVBoxLayout()
-                
-                image_label = QLabel()
-                image_label.setPixmap(pixmap.scaled(800, 600, Qt.KeepAspectRatio))
-                
-                close_btn = QPushButton('关闭')
-                close_btn.clicked.connect(dialog.close)
-                
-                layout.addWidget(image_label)
-                layout.addWidget(close_btn)
-                dialog.setLayout(layout)
-                dialog.exec_()
-            else:
-                QMessageBox.warning(self, '警告', '无法加载报警详情')
-        except Exception as e:
-            QMessageBox.critical(self, '错误', f'加载报警详情失败: {str(e)}')
-
     def show_admin_panel(self):
         if self.current_user['role'] == 'admin':
-            self.admin_panel = AdminPanel(self.token, self.current_user)
-            self.admin_panel.show()
-
-    def update_frame(self, frame, top, left, right, bottom):
-        if top != -1 and left != -1 and right != -1 and bottom != -1:
-            self.info_label.setText(f"发生火灾! 具体位置： top: {top}, left: {left}, right: {right}, bottom: {bottom}")
-            cv2.rectangle(frame, (left, top), (right, bottom), (0, 0, 255), 2)
-
-            # 保存报警图片
-            img_name = f"alarm_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-            img_path = os.path.join("alarm_images", img_name)
-            
-            # 确保目录存在
-            os.makedirs("alarm_images", exist_ok=True)
-            
-            # 保存图片
-            cv2.imwrite(img_path, frame)
-
-            try:
-                headers = {'Authorization': self.token, 'Content-Type': 'application/json'}
-                data = {
-                    'top': top,
-                    'left': left,
-                    'right': right,
-                    'bottom': bottom,
-                    'image_path': img_path
-                }
-                response = requests.post('http://localhost:5000/alarms', headers=headers, json=data)
-
-                if response.status_code == 201:
-                    self.load_alarms_to_map()
-                    self.update_emergency_stats()
-            except Exception as e:
-                print(f"Failed to save alarm: {str(e)}")
-
-        # 显示处理后的帧
-        frame = cv2.resize(frame, (640, 360))  # 调整显示尺寸
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w, ch = frame.shape
-        bytes_per_line = ch * w
-        q_img = QImage(frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
-        self.cv_label.setPixmap(QPixmap.fromImage(q_img))
+            # 创建并显示管理员面板
+            admin_panel = AdminPanel(self.token, self.current_user)
+            admin_panel.show()
 
     def stop_alarm(self):
         if self.media_player.state() == QMediaPlayer.PlayingState:
@@ -723,9 +801,8 @@ class MainWindow(QWidget):
         self.info_label.setText("")
 
     def closeEvent(self, event):
-        self.video_thread.stop()
+        self.video_thread.running = False
         self.video_thread.wait()
-        self.media_player.stop()
         event.accept()
 
     def update_emergency_stats(self):
@@ -756,6 +833,27 @@ class MainWindow(QWidget):
                 self.year_label.setText(f"本年\n{stats['year']}")
         except Exception as e:
             QMessageBox.critical(self, '错误', f'更新预警统计信息失败: {str(e)}')
+
+    def handle_frame_received(self, frame, top, left, right, bottom, alarm_id):
+        if top != -1 and left != -1 and right != -1 and bottom != -1:
+            # 在地图上添加标记
+            x = (left + right) // 2
+            y = (top + bottom) // 2
+            self.map_viewer.add_alarm_marker(x, y, alarm_id)
+
+    def load_existing_alarms(self):
+        try:
+            headers = {'Authorization': self.token}
+            response = requests.get('http://localhost:5000/alarms', headers=headers)
+
+            if response.status_code == 200:
+                alarms = response.json()
+                for alarm in alarms:
+                    x = (alarm['left_location'] + alarm.get('right_location', 0)) // 2
+                    y = (alarm['top_location'] + alarm.get('bottom_location', 0)) // 2
+                    self.map_viewer.add_alarm_marker(x, y, alarm['id'])
+        except Exception as e:
+            QMessageBox.critical(self, '错误', f'加载已有报警数据失败: {str(e)}')
 
 
 class AdminPanel(QWidget):
@@ -805,7 +903,7 @@ class AdminPanel(QWidget):
 
         self.alarm_table = QTableWidget()
         self.alarm_table.setColumnCount(6)
-        self.alarm_table.setHorizontalHeaderLabels(['ID', '时间', '位置', '图片路径', '状态', '操作'])  # 修改表头
+        self.alarm_table.setHorizontalHeaderLabels(['ID', '时间', '位置', '图片路径', '状态', '操作'])
         self.alarm_table.horizontalHeader().setStretchLastSection(True)
 
         layout.addWidget(self.alarm_table)
@@ -826,8 +924,7 @@ class AdminPanel(QWidget):
                     self.alarm_table.setItem(i, 2, QTableWidgetItem(
                         f"Top: {alarm['top_location']}, Left: {alarm['left_location']}"
                     ))
-                    # 兼容新旧字段名
-                    self.alarm_table.setItem(i, 3, QTableWidgetItem(alarm.get('image_path', alarm.get('video_path', 'N/A'))))
+                    self.alarm_table.setItem(i, 3, QTableWidgetItem(alarm.get('image_path', 'N/A')))
                     self.alarm_table.setItem(i, 4, QTableWidgetItem("未处理"))
 
                     process_btn = QPushButton('处理')
