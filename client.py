@@ -23,7 +23,7 @@ import json
 import os
 
 # 设置QT自动缩放
-os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
+os.environ["QT_SCALE_FACTOR"] = "1"
 
 # 图片保存目录
 IMAGE_SAVE_DIR = 'client_images'
@@ -206,7 +206,10 @@ class VideoStreamThread(QThread):
     def stop(self):
         """安全停止线程的方法"""
         self.running = False
-        self.wait()  # 等待线程结束
+        # 设置超时时间，避免无限期等待
+        if not self.wait(5000):  
+            self.terminate()
+            self.wait()
 
     def upload_image(self, image_path, top, left, right, bottom):
         try:
@@ -677,13 +680,22 @@ class MainWindow(QWidget):
         self.load_all_alarms()
 
         close_btn = QPushButton('关闭')
-        close_btn.clicked.connect(dialog.close)
+        # 绑定关闭按钮点击事件，在对话框关闭时更新紧急程度和预警统计
+        close_btn.clicked.connect(lambda: self.update_stats_after_dialog_close(dialog))
 
         layout.addWidget(query_group)
         layout.addWidget(self.alarm_display_table)
         layout.addWidget(close_btn)
         dialog.setLayout(layout)
         dialog.exec_()
+
+    def update_stats_after_dialog_close(self, dialog):
+        # 关闭对话框
+        dialog.close()
+        # 更新紧急程度统计
+        self.update_emergency_stats()
+        # 更新预警统计信息
+        self.update_alarm_stats()
 
     def load_all_alarms(self):
         try:
@@ -801,8 +813,7 @@ class MainWindow(QWidget):
         self.info_label.setText("")
 
     def closeEvent(self, event):
-        self.video_thread.running = False
-        self.video_thread.wait()
+        self.video_thread.stop()
         event.accept()
 
     def update_emergency_stats(self):
