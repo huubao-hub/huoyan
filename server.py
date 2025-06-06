@@ -145,7 +145,46 @@ def get_all_users(current_user):
         cursor.execute("SELECT * FROM users")
         users = cursor.fetchall()
         return jsonify(users)
+    
+# 用于删除报警记录
+@app.route('/alarms/<int:alarm_id>', methods=['DELETE'])
+@token_required
+def delete_alarm(current_user, alarm_id):
+    if current_user['role'] != 'admin':
+        return jsonify({'message': '只有管理员可以删除报警记录'}), 403
 
+    with connection.cursor() as cursor:
+        # 检查报警是否存在
+        cursor.execute("SELECT id FROM alarm WHERE id = %s", (alarm_id,))
+        if not cursor.fetchone():
+            return jsonify({'message': '报警不存在'}), 404
+
+        # 删除报警记录
+        cursor.execute("DELETE FROM alarm WHERE id = %s", (alarm_id,))
+        connection.commit()
+        return jsonify({'message': '报警记录已删除'})
+
+# 用于删除用户
+@app.route('/admin/users/<int:user_id>', methods=['DELETE'])
+@token_required
+def delete_user(current_user, user_id):
+    if current_user['role'] != 'admin':
+        return jsonify({'message': '只有管理员可以删除用户'}), 403
+
+    with connection.cursor() as cursor:
+        # 检查用户是否存在
+        cursor.execute("SELECT id FROM users WHERE id = %s", (user_id,))
+        if not cursor.fetchone():
+            return jsonify({'message': '用户不存在'}), 404
+
+        # 检查是否尝试删除自己
+        if current_user['id'] == user_id:
+            return jsonify({'message': '不能删除当前登录的用户'}), 400
+
+        # 删除用户
+        cursor.execute("DELETE FROM users WHERE id = %s", (user_id,))
+        connection.commit()
+        return jsonify({'message': '用户删除成功'})
 
 # 用于创建新用户
 @app.route('/admin/users', methods=['POST'])

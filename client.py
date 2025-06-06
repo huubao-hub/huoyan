@@ -913,9 +913,18 @@ class AdminPanel(QWidget):
         layout = QVBoxLayout()
 
         self.alarm_table = QTableWidget()
-        self.alarm_table.setColumnCount(6)
-        self.alarm_table.setHorizontalHeaderLabels(['ID', '时间', '位置', '图片路径', '状态', '操作'])
+        self.alarm_table.setColumnCount(7)
+        self.alarm_table.setHorizontalHeaderLabels(['ID', '时间', '位置', '图片路径', '状态', '处理', '误报处理'])
         self.alarm_table.horizontalHeader().setStretchLastSection(True)
+        
+        # 设置列宽
+        self.alarm_table.setColumnWidth(0, 50)   # ID
+        self.alarm_table.setColumnWidth(1, 150)  # 时间
+        self.alarm_table.setColumnWidth(2, 200)  # 位置
+        self.alarm_table.setColumnWidth(3, 200)  # 图片路径
+        self.alarm_table.setColumnWidth(4, 80)   # 状态
+        self.alarm_table.setColumnWidth(5, 80)   # 处理按钮
+        self.alarm_table.setColumnWidth(6, 100)  # 误报处理按钮
 
         layout.addWidget(self.alarm_table)
         self.alarm_tab.setLayout(layout)
@@ -928,6 +937,8 @@ class AdminPanel(QWidget):
             if response.status_code == 200:
                 alarms = response.json()
                 self.alarm_table.setRowCount(len(alarms))
+                self.alarm_table.setColumnCount(7)  # 增加一列
+                self.alarm_table.setHorizontalHeaderLabels(['ID', '时间', '位置', '图片路径', '状态', '处理', '误报处理'])
 
                 for i, alarm in enumerate(alarms):
                     self.alarm_table.setItem(i, 0, QTableWidgetItem(str(alarm['id'])))
@@ -938,11 +949,48 @@ class AdminPanel(QWidget):
                     self.alarm_table.setItem(i, 3, QTableWidgetItem(alarm.get('image_path', 'N/A')))
                     self.alarm_table.setItem(i, 4, QTableWidgetItem("未处理"))
 
+                    # 处理按钮
                     process_btn = QPushButton('处理')
+                    process_btn.setStyleSheet("background-color: #4CAF50; color: white;")
                     process_btn.clicked.connect(lambda _, id=alarm['id']: self.process_alarm(id))
                     self.alarm_table.setCellWidget(i, 5, process_btn)
+
+                    # 误报处理按钮
+                    false_alarm_btn = QPushButton('误报处理')
+                    false_alarm_btn.setStyleSheet("background-color: #f44336; color: white;")
+                    false_alarm_btn.clicked.connect(lambda _, id=alarm['id']: self.handle_false_alarm(id))
+                    self.alarm_table.setCellWidget(i, 6, false_alarm_btn)
         except Exception as e:
             QMessageBox.critical(self, '错误', f'加载未处理报警失败: {str(e)}')
+
+    def handle_false_alarm(self, alarm_id):
+        # 确认对话框
+        reply = QMessageBox.question(
+            self, '确认', 
+            '确定将此报警标记为误报并删除记录吗?',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            try:
+                headers = {'Authorization': self.token}
+                response = requests.delete(
+                    f'http://localhost:5000/alarms/{alarm_id}',
+                    headers=headers
+                )
+
+                if response.status_code == 200:
+                    QMessageBox.information(self, '成功', '误报处理成功，记录已删除')
+                    self.load_unprocessed_alarms()
+                    # 更新主窗口的统计信息
+                    main_window = self.parent()
+                    if main_window:
+                        main_window.update_emergency_stats()
+                        main_window.update_alarm_stats()
+                else:
+                    QMessageBox.warning(self, '错误', response.json().get('message', '处理误报失败'))
+            except Exception as e:
+                QMessageBox.critical(self, '错误', f'处理误报失败: {str(e)}')
 
     def process_alarm(self, alarm_id):
         try:
@@ -1039,15 +1087,29 @@ class AdminPanel(QWidget):
             QMessageBox.critical(self, '错误', f'添加用户失败: {str(e)}')
 
     def delete_user(self, user_id):
+        # 添加确认对话框
+        reply = QMessageBox.question(
+            self, '确认删除',
+            f'确定要删除ID为 {user_id} 的用户吗?',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        
+        if reply == QMessageBox.No:
+            return
+
         try:
             headers = {'Authorization': self.token}
-            response = requests.delete(f'http://localhost:5000/admin/users/{user_id}', headers=headers)
+            response = requests.delete(
+                f'http://localhost:5000/admin/users/{user_id}',
+                headers=headers
+            )
 
             if response.status_code == 200:
-                QMessageBox.information(self, '成功', '用户删除成功')
+                QMessageBox.information(self, '成功', response.json().get('message', '用户删除成功'))
                 self.load_users()
             else:
-                QMessageBox.warning(self, '错误', response.json().get('message', '删除用户失败'))
+                error_msg = response.json().get('message', '删除用户失败')
+                QMessageBox.warning(self, '错误', f'{error_msg} (状态码: {response.status_code})')
         except Exception as e:
             QMessageBox.critical(self, '错误', f'删除用户失败: {str(e)}')
 
